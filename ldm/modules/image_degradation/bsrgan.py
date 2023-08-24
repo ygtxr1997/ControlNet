@@ -515,7 +515,7 @@ def degradation_bsrgan(img, sf=4, lq_patchsize=72, isp_model=None):
             # add processed camera sensor noise
             if random.random() < isp_prob and isp_model is not None:
                 with torch.no_grad():
-                    img, hq = isp_model.forward(img.copy(), hq)
+                    img, hq = isp_model.forward(img.copy(), hq, )
 
     # add final JPEG compression noise
     img = add_JPEG_noise(img)
@@ -666,7 +666,7 @@ def degradation_bsrgan_plus(img, sf=4, shuffle_prob=0.5, use_sharp=True, lq_patc
         elif i == 5:
             if random.random() < isp_prob and isp_model is not None:
                 with torch.no_grad():
-                    img, hq = isp_model.forward(img.copy(), hq)
+                    img, hq = isp_model.forward(img.copy(), hq, )
         elif i == 6:
             img = add_JPEG_noise(img)
         elif i == 7:
@@ -684,7 +684,7 @@ def degradation_bsrgan_plus(img, sf=4, shuffle_prob=0.5, use_sharp=True, lq_patc
         elif i == 12:
             if random.random() < isp_prob and isp_model is not None:
                 with torch.no_grad():
-                    img, hq = isp_model.forward(img.copy(), hq)
+                    img, hq = isp_model.forward(img.copy(), hq, )
         else:
             print('check the shuffle!')
 

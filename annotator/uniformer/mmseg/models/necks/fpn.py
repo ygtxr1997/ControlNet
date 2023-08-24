@@ -51,7 +51,7 @@ class FPN(nn.Module):
         >>> inputs = [torch.rand(1, c, s, s)
         ...           for c, s in zip(in_channels, scales)]
         >>> self = FPN(in_channels, 11, len(in_channels)).eval()
-        >>> outputs = self.forward(inputs)
+        >>> outputs = self.forward(inputs,,
         >>> for i in range(len(outputs)):
         ...     print(f'outputs[{i}].shape = {outputs[i].shape}')
         outputs[0].shape = torch.Size([1, 11, 340, 340])

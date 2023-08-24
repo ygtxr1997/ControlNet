@@ -15,9 +15,9 @@ from torchvision.utils import make_grid
 from ldm.modules.attention import SpatialTransformer
 from ldm.modules.diffusionmodules.openaimodel import UNetModel, TimestepEmbedSequential, ResBlock, Downsample, AttentionBlock
 from ldm.models.diffusion.ddpm import LatentDiffusion
-from ldm.util import log_txt_as_img, exists, instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-
+from ldm.util import log_txt_as_img, exists, instantiate_from_config, default
+from ldm.data.tryon_dataset import TryOnDataset
+from cldm.ddim_hacked import DDIMSamplerTryOn as DDIMSampler  # use hacked ddim
 
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
@@ -312,43 +312,159 @@ class ControlNet(nn.Module):
 
 class ControlLDM(LatentDiffusion):
 
-    def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
+    def __init__(self, control_stage_config, control_key, only_mid_control, agnostic_key, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.control_model = instantiate_from_config(control_stage_config)
         self.control_key = control_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
+        self.agnostic_key = agnostic_key
+        self.val_dataset = TryOnDataset(
+            root="/cfs/yuange/datasets/VTON-HD",
+            mode="test",
+        )
+
+    def shared_step(self, batch, **kwargs):
+        x, c = self.get_input(batch, self.first_stage_key)
+        loss = self(x, c)  # call self.forward()
+        return loss
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
-        """ Called by super().shared_step and self.log_images """
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)  # x:"jpg" latent; c:"txt",(B,77,768)
+        """ (Overridden) Called by self.shared_step and self.log_images
+        @param: batch:
+                {
+                    "jpg": ground-truth person, (B,H,W,C)
+                    "txt": {"prompt": List[String], "cloth": masked cloth (B,H,W,C)
+                    "hint": openpose, (B,H,W,C)
+                    "agnostic": cloth-agnostic person, (B,H,W,C)
+                }
+        @returns:
+                ret_x: {
+                    "z_x": x,
+                    "z_ag": z_ag
+                },
+                ret_c: {
+                    "c_crossattn": [ori_condition:{"prompt":List[String], "cloth":(B,224,224,RGB)}],
+                    "c_concat": [control:(B,3,H//8,W//8)]
+                }
+        """
+        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
+        # x: z of "jpg", processed by first_stage_config.target
+        # c: "txt" condition, processed by cond_stage_config.target
+
+        ag = batch[self.agnostic_key]  # "agnostic"
+        if ag is not None:
+            ag = ag[:bs]
+        ag = ag.to(self.device)
+        ag = rearrange(ag, 'b h w c -> b c h w')
+        ag = ag.to(memory_format=torch.contiguous_format).float()
+        encoder_posterior = self.encode_first_stage(ag)
+        z_ag = self.get_first_stage_encoding(encoder_posterior).detach()  # z_ag: latent of "agnostic"
+
         control = batch[self.control_key]  # "hint"
         if bs is not None:
             control = control[:bs]
         control = control.to(self.device)  # (B,H,W,RGB), in [-1,1]
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+        return {"z_x": x, "z_ag": z_ag}, dict(c_crossattn=[c], c_concat=[control])
+
+    def forward(self, x, c, *args, **kwargs):
+        """ Called by self.shared_step """
+        z_x = x["z_x"]
+        t = torch.randint(0, self.num_timesteps, (z_x.shape[0],), device=self.device).long()
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:  # the grads can be backward propagated here
+                # call cond_stage_config.target: FrozenCLIPTextImageEmbedder
+                c_cloth = c["c_crossattn"][0]["cloth"].to(self.device)
+                c_cloth = rearrange(c_cloth, 'b h w c -> b c h w')
+                c_cloth = c_cloth.to(memory_format=torch.contiguous_format).float()
+                c_text_image_dict = {
+                    "text": c["c_crossattn"][0]["prompt"],
+                    "image": c_cloth,
+                }
+                c_crossattn = self.get_learned_conditioning(c_text_image_dict)  # c: (B,77+257,768)
+                c = dict(c_crossattn=[c_crossattn], c_concat=c["c_concat"])
+        return self.p_losses(x, c, t, *args, **kwargs)
+
+    def p_losses(self, x_start, cond, t, noise=None):
+        """ Called by self.forward
+        @param x_start: {"z_x":..., "z_ag":...} dict of z_x and z_ag
+        @param cond: {"c_crossattn(context)":[(B,77+257,768)], "c_concat(control)":[(B,RGB,H,W)]}
+        @param t: time embedding
+        @param noise: noise
+        """
+        z_x = x_start["z_x"]
+        z_ag = x_start["z_ag"]
+        noise = default(noise, lambda: torch.randn_like(z_x))
+        x_noisy = self.q_sample(x_start=z_x, t=t, noise=noise)
+        model_output = self.apply_model({"noisy": x_noisy, "z_ag": z_ag}, t, cond)
+
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+
+        if self.parameterization == "x0":
+            target = z_x
+        elif self.parameterization == "eps":  # default
+            target = noise
+        elif self.parameterization == "v":
+            target = self.get_v(z_x, noise, t)
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+        logvar_t = self.logvar[t].to(self.device)
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        if self.learn_logvar:
+            loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+            loss_dict.update({'logvar': self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+        loss += (self.original_elbo_weight * loss_vlb)
+        loss_dict.update({f'{prefix}/loss': loss})
+
+        return loss, loss_dict
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        assert isinstance(x_noisy, dict)
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
+        # self.model created by DDPM(super.super): DiffusionWrapper
+        # self.model.diffusion_model is unet_config.target: ControlledUnetModel
 
-        cond_txt = torch.cat(cond['c_crossattn'], 1)  # prompts
+        cond_txt = torch.cat(cond['c_crossattn'], 1)  # prompts features extracted by cond_stage_config, (B,C,dim)
 
-        if cond['c_concat'] is None:  # control
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
-        else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+        z_x_noisy = x_noisy["noisy"]
+        z_ag = x_noisy["z_ag"]
+        z_cat = torch.cat([z_x_noisy, z_ag], dim=1)  # concatenate at channel dimension
+        if cond['c_concat'] is None:  # control is None
+            eps = diffusion_model(x=z_cat, timesteps=t, context=cond_txt, control=None,
+                                  only_mid_control=self.only_mid_control)
+        else:  # control is not None
+            control = self.control_model(x=z_cat, hint=torch.cat(cond['c_concat'], 1),
+                                         timesteps=t, context=cond_txt)  # control_stage_config: ControlNet
             control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+            eps = diffusion_model(x=z_cat, timesteps=t, context=cond_txt, control=control,
+                                  only_mid_control=self.only_mid_control)
 
         return eps
 
     @torch.no_grad()
     def get_unconditional_conditioning(self, N):
-        return self.get_learned_conditioning([""] * N)
+        c_unconditional_text_image_dict = {
+            "text": [""] * N,
+            "image": torch.zeros(N, 3, 224, 224).to(self.device),
+        }
+        return self.get_learned_conditioning(c_unconditional_text_image_dict)
 
     @torch.no_grad()
     def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
@@ -359,13 +475,27 @@ class ControlLDM(LatentDiffusion):
         use_ddim = ddim_steps is not None
 
         log = dict()
-        z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+        z_dict, c_dict = self.get_input(batch, self.first_stage_key, bs=N)
+        z = z_dict["z_x"]
+        c_cat = c_dict["c_concat"][0][:N]
+        # c = {
+        #     "text": c_dict["c_crossattn"][0]["prompt"][:N],
+        #     "image": c_dict["c_crossattn"][0]["cloth"][:N]
+        # }  # should be processed by cond_stage_config.target
+        c_cloth = c_dict["c_crossattn"][0]["cloth"][:N].to(self.device)
+        c_cloth = rearrange(c_cloth, 'b h w c -> b c h w')
+        c_cloth = c_cloth.to(memory_format=torch.contiguous_format).float()
+        c_text_image_dict = {
+            "text": c_dict["c_crossattn"][0]["prompt"][:N],
+            "image": c_cloth,
+        }
+        c = self.get_learned_conditioning(c_text_image_dict)
+
         N = min(z.shape[0], N)
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
         log["control"] = c_cat * 2.0 - 1.0
-        log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key], size=16)
+        log["conditioning"] = log_txt_as_img((512, 512), batch[self.cond_stage_key]["prompt"], size=16)
 
         if plot_diffusion_rows:
             # get diffusion row
@@ -413,7 +543,7 @@ class ControlLDM(LatentDiffusion):
 
     @torch.no_grad()
     def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
-        ddim_sampler = DDIMSampler(self)
+        ddim_sampler = DDIMSampler(self, tryon_dataset=self.val_dataset)
         b, c, h, w = cond["c_concat"][0].shape
         shape = (self.channels, h // 8, w // 8)
         samples, intermediates = ddim_sampler.sample(ddim_steps, batch_size, shape, cond, verbose=False, **kwargs)

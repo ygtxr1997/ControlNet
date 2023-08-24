@@ -17,7 +17,7 @@ from functools import partial
 import itertools
 from tqdm import tqdm
 from torchvision.utils import make_grid
-from pytorch_lightning.utilities.distributed import rank_zero_only
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from omegaconf import ListConfig
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
@@ -588,7 +588,7 @@ class LatentDiffusion(DDPM):
 
     @rank_zero_only
     @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=None):
         # only for very first batch
         if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
@@ -766,26 +766,28 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, return_x=False):
-        x = super().get_input(batch, k)
+        """ Called by train and validation steps, and Son-Class ControlLDM """
+        x = super().get_input(batch, k)  # k:first_stage_key, x:(B,C,H,W)
         if bs is not None:
-            x = x[:bs]
+            x = x[:bs]  # for log
         x = x.to(self.device)
         encoder_posterior = self.encode_first_stage(x)
-        z = self.get_first_stage_encoding(encoder_posterior).detach()
+        z = self.get_first_stage_encoding(encoder_posterior).detach()  # latent of input image
 
-        if self.model.conditioning_key is not None and not self.force_null_conditioning:
+        if self.model.conditioning_key is not None and not self.force_null_conditioning:  # crossattn
             if cond_key is None:
-                cond_key = self.cond_stage_key
+                cond_key = self.cond_stage_key  # "txt"
             if cond_key != self.first_stage_key:
                 if cond_key in ['caption', 'coordinates_bbox', "txt"]:
-                    xc = batch[cond_key]
+                    xc = batch[cond_key]  # input condition
                 elif cond_key in ['class_label', 'cls']:
                     xc = batch
                 else:
                     xc = super().get_input(batch, cond_key).to(self.device)
             else:
                 xc = x
-            if not self.cond_stage_trainable or force_c_encode:
+            if not self.cond_stage_trainable or force_c_encode:  # froze cond_stage
+                print("[ddpm] xc should be a list of text or a dict of text and image:", type(xc), type(xc[0]))
                 if isinstance(xc, dict) or isinstance(xc, list):
                     c = self.get_learned_conditioning(xc)
                 else:
@@ -795,7 +797,7 @@ class LatentDiffusion(DDPM):
             if bs is not None:
                 c = c[:bs]
 
-            if self.use_positional_encodings:
+            if self.use_positional_encodings:  # default: False
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 ckey = __conditioning_keys__[self.model.conditioning_key]
                 c = {ckey: c, 'pos_x': pos_x, 'pos_y': pos_y}
@@ -807,12 +809,12 @@ class LatentDiffusion(DDPM):
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
         out = [z, c]
-        if return_first_stage_outputs:
+        if return_first_stage_outputs:  # for log
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
-        if return_x:
+        if return_x:  # for log
             out.extend([x])
-        if return_original_cond:
+        if return_original_cond:  # for log
             out.append(xc)
         return out
 
@@ -833,7 +835,15 @@ class LatentDiffusion(DDPM):
 
     def shared_step(self, batch, **kwargs):
         x, c = self.get_input(batch, self.first_stage_key)
-        loss = self(x, c)
+        """
+        (1) for cldm.cldm.ControlLDM:
+            x: z_x, latent of x
+            c: {
+                "c_crossattn": [learned_condition:(B,77,768)]
+                "c_concat": [control:(B,3,H//8,W//8)]
+            }
+        """
+        loss = self(x, c)  # call self.forward()
         return loss
 
     def forward(self, x, c, *args, **kwargs):
@@ -841,7 +851,7 @@ class LatentDiffusion(DDPM):
         if self.model.conditioning_key is not None:
             assert c is not None
             if self.cond_stage_trainable:
-                c = self.get_learned_conditioning(c)
+                c = self.get_learned_conditioning(c)  # the grads can be backward propagated here
             if self.shorten_cond_schedule:  # TODO: drop this option
                 tc = self.cond_ids[t].to(self.device)
                 c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
@@ -892,7 +902,7 @@ class LatentDiffusion(DDPM):
 
         if self.parameterization == "x0":
             target = x_start
-        elif self.parameterization == "eps":
+        elif self.parameterization == "eps":  # default
             target = noise
         elif self.parameterization == "v":
             target = self.get_v(x_start, noise, t)

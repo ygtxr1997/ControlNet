@@ -31,11 +31,11 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
         img = resize_image(input_image, image_resolution)
         H, W, C = img.shape
 
-        detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_NEAREST)
+        detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_NEAREST)  # (H,W,3), in [0,255]
 
         control = torch.from_numpy(detected_map.copy()).float().cuda() / 255.0
         control = torch.stack([control for _ in range(num_samples)], dim=0)
-        control = einops.rearrange(control, 'b h w c -> b c h w').clone()
+        control = einops.rearrange(control, 'b h w c -> b c h w').clone()  # (B,3,H,W), in [0,1]
 
         if seed == -1:
             seed = random.randint(0, 65535)
@@ -60,7 +60,7 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
         if config.save_memory:
             model.low_vram_shift(is_diffusing=False)
 
-        x_samples = model.decode_first_stage(samples)
+        x_samples = model.decode_first_stage(samples)  # in [-1,1]
         x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
 
         results = [x_samples[i] for i in range(num_samples)]

@@ -518,7 +518,7 @@ def degradation_bsrgan(img, sf=4, lq_patchsize=72, isp_model=None):
             # add processed camera sensor noise
             if random.random() < isp_prob and isp_model is not None:
                 with torch.no_grad():
-                    img, hq = isp_model.forward(img.copy(), hq)
+                    img, hq = isp_model.forward(img.copy(), hq, )
 
     # add final JPEG compression noise
     img = add_JPEG_noise(img)

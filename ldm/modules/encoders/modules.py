@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
+from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel, CLIPVisionModel
 
 import open_clip
 from ldm.util import default, count_params
@@ -115,6 +115,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
             param.requires_grad = False
 
     def forward(self, text):
+        """ Input text is a list of text strings """
         batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
                                         return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
         tokens = batch_encoding["input_ids"].to(self.device)
@@ -129,6 +130,75 @@ class FrozenCLIPEmbedder(AbstractEncoder):
 
     def encode(self, text):
         return self(text)
+
+
+class FrozenCLIPTextImageEmbedder(AbstractEncoder):
+    """Uses the CLIP encoder for text and image (from huggingface)"""
+    LAYERS = [
+        "last",
+        "pooled",
+        "hidden"
+    ]
+    def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77,
+                 freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
+        super().__init__()
+        assert layer in self.LAYERS
+        self.tokenizer = CLIPTokenizer.from_pretrained(version)
+        self.transformer = CLIPTextModel.from_pretrained(version)
+        self.image_encoder = CLIPVisionModel.from_pretrained(version)
+        self.image_projection = nn.Linear(1024, 768, bias=False)  # learnable
+
+        self.device = device
+        self.max_length = max_length
+        if freeze:
+            self.freeze()
+        self.layer = layer
+        self.layer_idx = layer_idx
+        if layer == "hidden":
+            assert layer_idx is not None
+            assert 0 <= abs(layer_idx) <= 12
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(
+            self.image_projection.weight,
+            std=1024 ** -0.5 * 0.02,
+        )
+
+    def freeze(self):
+        self.transformer = self.transformer.eval()
+        self.image_encoder = self.image_encoder.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+        for param in self.image_projection.parameters():  # unfreeze the projection layer
+            param.requires_grad = True
+
+    def forward(self, text_image_dict):
+        assert isinstance(text_image_dict, dict)
+        text = text_image_dict["text"]  # List[String]
+        image = text_image_dict["image"]  # (B,C,H,W), in [-1,1]
+
+        ''' 1. text '''
+        batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
+                                        return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
+        tokens = batch_encoding["input_ids"].to(self.device)
+        outputs = self.transformer(input_ids=tokens, output_hidden_states=self.layer=="hidden")
+        if self.layer == "last":
+            z = outputs.last_hidden_state
+        elif self.layer == "pooled":
+            z = outputs.pooler_output[:, None, :]
+        else:
+            z = outputs.hidden_states[self.layer_idx]
+
+        ''' 2. image '''
+        z_image = self.image_encoder(image).last_hidden_state
+        z_image = self.image_projection(z_image)
+
+        return torch.cat([z, z_image], dim=1)  # (B,77+257,768)
+
+    def encode(self, text_image_dict):
+        return self(text_image_dict)
 
 
 class FrozenOpenCLIPEmbedder(AbstractEncoder):
@@ -211,3 +281,59 @@ class FrozenCLIPT5Encoder(AbstractEncoder):
         return [clip_z, t5_z]
 
 
+if __name__ == "__main__":
+    import torch
+    import transformers
+    from transformers import AutoTokenizer, CLIPTextModel, CLIPProcessor, CLIPVisionModel, CLIPModel
+    from transformers import CLIPVisionModelWithProjection
+
+    transformers.utils.logging.set_verbosity_error()
+
+    text = ["hello", "world"]
+    xt = torch.ones((2, 7))
+    xt = xt.long()
+    xi = torch.randn((2, 3, 224, 224)).clamp(-1, 1)
+
+    visual_proj = nn.Linear(1024, 768, bias=False)
+
+    version = "openai/clip-vit-large-patch14"
+
+    ''' text '''
+    # text_tokenizer = CLIPTokenizer.from_pretrained(version)
+    # text_encoder = CLIPTextModel.from_pretrained(version)
+    #
+    # tokens = text_tokenizer(text, max_length=77, return_length=True,
+    #                         return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
+    # tokens = tokens["input_ids"]
+    # print("[text] tokenizer output:", tokens.shape)
+    # outputs = text_encoder(input_ids=tokens)
+    # print("[text] encoder output:", outputs.last_hidden_state.shape)
+    #
+    # outputs = text_encoder(input_ids=xt)
+    # print("[text] encoder directly output:", outputs.last_hidden_state.shape)
+
+    ''' image '''
+    # image_encoder = CLIPVisionModel.from_pretrained(version)
+    # outputs = image_encoder(xi)
+    # print("[image] encoder output:")
+    # for k in outputs.keys():
+    #     print(f"|---{k}: {outputs[k].shape}; after projection: {visual_proj(outputs[k]).shape}")
+    #
+    # image_encoder_proj = CLIPVisionModelWithProjection.from_pretrained(version)
+    # outputs = image_encoder_proj(xi)
+    # print("[image] encoder_with_projection output:")
+    # for k in outputs.keys():
+    #     print(f"|---{k}: {outputs[k].shape}")
+
+    ''' both '''
+    # both_encoder = CLIPModel.from_pretrained(version)
+    # output_text = both_encoder.get_text_features(xt)
+    # output_image = both_encoder.get_image_features(xi)
+    # print("[both] encoder output:")
+    # print(f"|---text: {output_text.shape}")
+    # print(f"|---image: {output_image.shape}")
+
+    ''' my FrozenCLIPTextImageEmbedder '''
+    net = FrozenCLIPTextImageEmbedder().cuda()
+    z = net({"text": text, "image": xi.cuda()})
+    print("[FrozenCLIPTextImageEmbedder] output:", z.shape)
