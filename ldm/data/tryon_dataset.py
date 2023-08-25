@@ -5,11 +5,104 @@ import cv2
 import numpy as np
 import torch
 
+from tqdm import tqdm
+from einops import rearrange
 from torch.utils.data import Dataset
 
 
 training_prompts = [
     "a photo",
+    'the photo',
+    'a dark photo',
+    'a close-up photo',
+    'a good photo',
+    'a bright photo',
+    'an illustration',
+    'a rendering',
+    'a cropped photo',
+    'a rendition',
+    'a depiction',
+    'a photo of a person',
+    'a rendering of a person',
+    'a cropped photo of the person',
+    'the photo of a person',
+    'a photo of a clean person',
+    'a photo of a dirty person',
+    'a dark photo of the person',
+    'a photo of my person',
+    'a photo of the cool person',
+    'a close-up photo of a person',
+    'a bright photo of the person',
+    'a cropped photo of a person',
+    'a photo of the person',
+    'a good photo of the person',
+    'a photo of one person',
+    'a close-up photo of the person',
+    'a rendition of the person',
+    'a photo of the clean person',
+    'a rendition of a person',
+    'a photo of a nice person',
+    'a good photo of a person',
+    'a photo of the nice person',
+    'a photo of the small person',
+    'a photo of the weird person',
+    'a photo of the large person',
+    'a photo of a cool person',
+    'a photo of a small person',
+    'an illustration of a person',
+    'a rendering of a person',
+    'a cropped photo of the person',
+    'the photo of a person',
+    'an illustration of a clean person',
+    'an illustration of a dirty person',
+    'a dark photo of the person',
+    'an illustration of my person',
+    'an illustration of the cool person',
+    'a close-up photo of a person',
+    'a bright photo of the person',
+    'a cropped photo of a person',
+    'an illustration of the person',
+    'a good photo of the person',
+    'an illustration of one person',
+    'a close-up photo of the person',
+    'a rendition of the person',
+    'an illustration of the clean person',
+    'a rendition of a person',
+    'an illustration of a nice person',
+    'a good photo of a person',
+    'an illustration of the nice person',
+    'an illustration of the small person',
+    'an illustration of the weird person',
+    'an illustration of the large person',
+    'an illustration of a cool person',
+    'an illustration of a small person',
+    'a depiction of a person',
+    'a rendering of a person',
+    'a cropped photo of the person',
+    'the photo of a person',
+    'a depiction of a clean person',
+    'a depiction of a dirty person',
+    'a dark photo of the person',
+    'a depiction of my person',
+    'a depiction of the cool person',
+    'a close-up photo of a person',
+    'a bright photo of the person',
+    'a cropped photo of a person',
+    'a depiction of the person',
+    'a good photo of the person',
+    'a depiction of one person',
+    'a close-up photo of the person',
+    'a rendition of the person',
+    'a depiction of the clean person',
+    'a rendition of a person',
+    'a depiction of a nice person',
+    'a good photo of a person',
+    'a depiction of the nice person',
+    'a depiction of the small person',
+    'a depiction of the weird person',
+    'a depiction of the large person',
+    'a depiction of a cool person',
+    'a depiction of a small person',
 ]
 
 
@@ -109,33 +202,70 @@ class TryOnDataset(Dataset):
                     txt={"prompt": prompt, "cloth": cloth_masked},  # conditional inputs
                     hint=openpose,  # controlnet hint
                     agnostic=agnostic)  # concat with de-noised image
-
+    
+    @staticmethod
+    def _nhwc_to_1hwrgb(x: torch.Tensor, is_zero_center: bool = True):
+        x = x[0]
+        if is_zero_center:
+            x = (x + 1.) * 127.5
+        else:
+            x *= 255.
+        x = x.cpu().numpy().astype(np.uint8)
+        x = cv2.cvtColor(x, cv2.COLOR_RGB2BGR)  # to open-cv BGR format
+        return x
+    
+    def get_batch0_snapshot(self, batch_dict: dict):
+        return dict(
+            jpg=self._nhwc_to_1hwrgb(batch_dict["jpg"]),
+            txt={"prompt": batch_dict["txt"]["prompt"][0], 
+                 "cloth": self._nhwc_to_1hwrgb(batch_dict["txt"]["cloth"])},
+            hint=self._nhwc_to_1hwrgb(batch_dict["hint"], is_zero_center=False),
+            agnostic=self._nhwc_to_1hwrgb(batch_dict["agnostic"])
+        )
+        
 
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
-    batch_size = 4
+    batch_size = 1
     dataset = TryOnDataset(
         root="/cfs/yuange/datasets/VTON-HD",
         mode="train",
     )
-    dataloader = DataLoader(dataset, num_workers=2, batch_size=batch_size, shuffle=True)
-    for index, batch in enumerate(dataloader):
-        for key in batch.keys():
-            val = batch[key]
-            if isinstance(val, np.ndarray) or isinstance(val, torch.Tensor):
-                print(f"{key}:", val.shape)
-            elif isinstance(val, list):
-                print(f"{key}:", len(val))
-            elif isinstance(val, dict):
-                print(f"{key}:", val.keys())
-                for k in val.keys():
-                    if isinstance(val[k], list):
-                        print(f"|---{k}:", len(val[k]))
-                    elif isinstance(val[k], torch.Tensor):
-                        print(f"|---{k}:", val[k].shape)
-                    else:
-                        print(f"|---{k}:", type(val[k]))
-            else:
-                print(f"{key}:", type(val))
-        exit()
+    dataloader = DataLoader(dataset, num_workers=2, batch_size=batch_size, shuffle=False)
+
+    """ Check output files """
+    snapshot_folder = "./snapshot"
+    if os.path.exists(snapshot_folder):
+        os.system(f"rm -r {snapshot_folder}")
+    os.makedirs(snapshot_folder, exist_ok=True)
+    max_index = 10
+
+    for index, batch in enumerate(tqdm(dataloader)):
+        if index >= max_index:
+            break
+        if index == 0:
+            for key in batch.keys():
+                val = batch[key]
+                if isinstance(val, np.ndarray) or isinstance(val, torch.Tensor):
+                    print(f"{key}:", val.shape)
+                elif isinstance(val, list):
+                    print(f"{key}:", len(val))
+                elif isinstance(val, dict):
+                    print(f"{key}:", val.keys())
+                    for k in val.keys():
+                        if isinstance(val[k], list):
+                            print(f"|---{k}:", len(val[k]))
+                        elif isinstance(val[k], torch.Tensor):
+                            print(f"|---{k}:", val[k].shape)
+                        else:
+                            print(f"|---{k}:", type(val[k]))
+                else:
+                    print(f"{key}:", type(val))
+        snapshot = dataset.get_batch0_snapshot(batch)
+        fn = "id{:05d}".format(index)
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "01person")), snapshot["jpg"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "02cloth")), snapshot["txt"]["cloth"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "03openpose")), snapshot["hint"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "04agnostic")), snapshot["agnostic"])
+    print(f"Snapshot files saved to: {snapshot_folder}")
