@@ -18,13 +18,15 @@ model:
     scale_factor: 0.18215
     use_ema: False
     only_mid_control: False
+    drop_cond_rate: 0.1
+    feed_cloth_to_controlnet: False  # consistent with hint_channels
 
     control_stage_config:
       target: cldm.tryon_cldm.ControlNet
       params:
         image_size: 32 # unused
-        in_channels: 8  # doubled due to "agnostic" concatenation
-        hint_channels: 3
+        in_channels: 9  # z_x:4, z_ag:4, z_ag_m:1
+        hint_channels: 3  # openpose:3, cloth:3, cloth_m:1
         model_channels: 320
         attention_resolutions: [ 4, 2, 1 ]
         num_res_blocks: 2
@@ -40,7 +42,7 @@ model:
       target: cldm.tryon_cldm.ControlledUnetModel
       params:
         image_size: 32 # unused
-        in_channels: 8  # doubled due to "agnostic" concatenation
+        in_channels: 9  # z_x:4, z_ag:4, z_ag_m:1
         out_channels: 4
         model_channels: 320
         attention_resolutions: [ 4, 2, 1 ]
@@ -78,3 +80,24 @@ model:
 
     cond_stage_config:
       target: ldm.modules.encoders.modules.FrozenCLIPTextImageEmbedder
+      params:
+        image_layer: "last"  # "last":1024, "projection":768
+        use_text: False
+
+train:
+  sd_path: "./models/control_sd15_openpose.pth"
+  sd_locked: True
+  only_mid_control: False
+  batch_size: 4
+  logger_freq: 150
+  learning_rate: 1e-5
+  zero_init_input_blocks: True
+
+  dataset_train_config:
+    target: ldm.data.tryon_dataset.TryOnDataset
+    params:
+      root: "/cfs/yuange/datasets/VTON-HD"
+      mode: "train"
+      reconstruct_rate: 0.
+      use_warp_pasted_agnostic: True
+
