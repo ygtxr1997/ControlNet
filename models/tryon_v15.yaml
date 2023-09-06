@@ -79,7 +79,7 @@ model:
           target: torch.nn.Identity
 
     cond_stage_config:
-      target: ldm.modules.encoders.modules.FrozenCLIPTextImageEmbedder
+      target: ldm.modules.encoders.modules.FrozenPVTImageEncoder
       params:
         image_layer: "last"  # "last":1024, "projection":768
         use_text: False

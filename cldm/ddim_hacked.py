@@ -1,6 +1,7 @@
 """SAMPLING ONLY."""
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from einops import rearrange, repeat
@@ -323,7 +324,7 @@ class DDIMSamplerTryOn(DDIMSampler):
     def __init__(self, model, schedule="linear", tryon_dataset=None, **kwargs):
         super().__init__(model=model, schedule=schedule, **kwargs)
         self.cloth_agnostic_dataset = tryon_dataset
-    def _get_try_on_test_images(self, index: int = None, batch_size: int = 1):
+    def _get_try_on_test_images(self, index: int = None, batch_size: int = 1,):
         if index is None:
             index = np.random.randint(len(self.cloth_agnostic_dataset))
         item = self.cloth_agnostic_dataset[index]
@@ -332,26 +333,45 @@ class DDIMSamplerTryOn(DDIMSampler):
         cloth_masked = item["txt"]["cloth"]
         agnostic = item["agnostic"]
         openpose = item["hint"]
+        agnostic_mask = item["agnostic_mask"]
 
         person = self._hwc_to_bchw(person, bs=batch_size)
         cloth_masked = self._hwc_to_bchw(cloth_masked, bs=batch_size)
         agnostic = self._hwc_to_bchw(agnostic, bs=batch_size, need_encode=True)
         openpose = self._hwc_to_bchw(openpose, bs=batch_size)
+        agnostic_mask = self._hwc_to_bchw(agnostic_mask, bs=batch_size, downsample_tgt_size=agnostic.shape[-2:])
 
-        return person, cloth_masked, agnostic, openpose
+        return person, cloth_masked, agnostic, openpose, agnostic_mask
 
-    def _hwc_to_bchw(self, x, bs, need_encode: bool = False):
+    def _hwc_to_bchw(self, x, bs, need_encode: bool = False,
+                     downsample_tgt_size: tuple = None):
         device = self.model.betas.device
         x = torch.FloatTensor(x)
         x = x.to(device)
-        x = x.unsqueeze(0)
+        x = x.unsqueeze(0)  # add batch dim
+        if x.ndim == 3:
+            x = x.unsqueeze(-1)  # add channel dim
         x = rearrange(x, 'b h w c -> b c h w')
         x = x.repeat(bs, 1, 1, 1)
         x = x.to(memory_format=torch.contiguous_format).float()
         if need_encode:
             encoder_posterior = self.model.encode_first_stage(x)
             x = self.model.get_first_stage_encoding(encoder_posterior).detach()
+        if downsample_tgt_size is not None:
+            x = F.interpolate(x, size=downsample_tgt_size, mode="bilinear", align_corners=True)
         return x
+
+    def get_apply_input(self, index: int = 0, num_samples: int = 1,
+                        device: torch.device = None):
+        person, cloth_masked, agnostic_enc, openpose, agnostic_mask = self._get_try_on_test_images(
+            index=index,
+            batch_size=num_samples,
+        )
+        agnostic_enc = agnostic_enc.to(device)
+        openpose = openpose.to(device)
+        cloth_masked = cloth_masked.to(device)
+        agnostic_mask = agnostic_mask.to(device)
+        return agnostic_enc, openpose, cloth_masked, agnostic_mask
 
     @torch.no_grad()
     def ddim_sampling(self, cond, shape,
@@ -365,11 +385,15 @@ class DDIMSamplerTryOn(DDIMSampler):
         b = shape[0]
         if x_T is None:
             img = torch.randn(shape, device=device)
+            raise ValueError("No agnostic input!")
         else:
-            img = x_T
+            assert isinstance(x_T, dict)
+            img = x_T["z_x"] if x_T["z_x"] is not None else torch.randn(shape, device=device)
+            agnostic = x_T["z_ag"]
+            agnostic_mask = x_T["z_ag_m"]
 
         # for TryOn
-        person, cloth_masked, agnostic, openpose = self._get_try_on_test_images(index=None, batch_size=b)
+        # person, cloth_masked, agnostic, openpose = self._get_try_on_test_images(index=None, batch_size=b)
 
         if timesteps is None:
             timesteps = self.ddpm_num_timesteps if ddim_use_original_steps else self.ddim_timesteps
@@ -404,7 +428,7 @@ class DDIMSamplerTryOn(DDIMSampler):
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
                                       dynamic_threshold=dynamic_threshold,
-                                      agnostic=agnostic,
+                                      agnostic=agnostic, agnostic_mask=agnostic_mask,
                                       )
             img, pred_x0 = outs
             if callback: callback(i)
@@ -421,13 +445,16 @@ class DDIMSamplerTryOn(DDIMSampler):
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
                       dynamic_threshold=None,
-                      agnostic=None,
+                      agnostic=None, agnostic_mask=None
                       ):
         b, *_, device = *x.shape, x.device
 
+        # z_ag = self.model.q_sample(x_start=agnostic, t=t, noise=torch.randn_like(agnostic))  # agnostic also noised at inference
+        z_ag = agnostic
         apply_x_input = {
             "noisy": x,
-            "z_ag": agnostic,
+            "z_ag": z_ag,
+            "z_ag_m": agnostic_mask,
         }
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             model_output = self.model.apply_model(apply_x_input, t, c)

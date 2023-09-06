@@ -110,6 +110,8 @@ class TryOnDataset(Dataset):
     def __init__(self, root: str,
                  mode: str = "train",
                  down_scale: float = 2.0,
+                 reconstruct_rate: float = 0.,
+                 use_warp_pasted_agnostic: bool = False,
                  ):
         self.root = root
         assert mode in ("train", "val", "test"), "[TryOnDataset] mode not supported!"
@@ -118,8 +120,12 @@ class TryOnDataset(Dataset):
         self.pairs_file = os.path.join(root, f"{self.folder_name}_pairs.txt")
         self.folder_path = os.path.join(root, self.folder_name)
         self.down_scale = down_scale
+        self.reconstruct_rate = reconstruct_rate
+        self.use_warp_pasted_agnostic = use_warp_pasted_agnostic
 
         self.data = self._load_dataset()
+        print(f"[TryOnDataset] dataset loaded from {root}, mode={mode}, "
+              f"reconstruct_rate={reconstruct_rate}.")
 
     def _load_dataset(self):
         with open(self.pairs_file, "r") as f:  # not used
@@ -134,6 +140,8 @@ class TryOnDataset(Dataset):
         self.agnostic_parses = glob.glob(f"{self.folder_path}/image-parse-agnostic-v3.2/*")
         self.cloth_imgs = glob.glob(f"{self.folder_path}/cloth/*")
         self.cloth_masks = glob.glob(f"{self.folder_path}/cloth-mask/*")
+        self.cloth_warp_imgs = glob.glob(f"{self.folder_path}/cloth-warp/*")
+        self.cloth_warp_masks = glob.glob(f"{self.folder_path}/cloth-warp-mask/*")
 
         data_list = []
         n = len(self.person_imgs)
@@ -149,6 +157,8 @@ class TryOnDataset(Dataset):
                     "agnostic_parse": self.agnostic_parses[i],
                     "cloth_img": self.cloth_imgs[i],
                     "cloth_mask": self.cloth_masks[i],
+                    "cloth_warp_img": self.cloth_warp_imgs[i],
+                    "cloth_warp_mask": self.cloth_warp_masks[i],
                 }
             )
 
@@ -165,14 +175,27 @@ class TryOnDataset(Dataset):
         agnostic_fn = item["agnostic_img"]
         cloth_fn = item["cloth_img"]
         cloth_mask_fn = item["cloth_mask"]
+        person_parse_fn = item["person_parse"]
+        cloth_warp_fn = item["cloth_warp_img"]
+        cloth_warp_mask_fn = item["cloth_warp_mask"]
 
         prompt = training_prompts[np.random.randint(len(training_prompts))]
 
         person = cv2.imread(person_fn)
         openpose = cv2.imread(openpose_fn)
-        agnostic = cv2.imread(agnostic_fn)
+        # agnostic = cv2.imread(agnostic_fn)
         cloth = cv2.imread(cloth_fn)
         cloth_mask = cv2.imread(cloth_mask_fn)
+        person_parse = cv2.imread(person_parse_fn)  # BGR
+        agnostic_mask = np.zeros(person_parse.shape).astype(np.uint8)
+        cloth_warp = cv2.imread(cloth_warp_fn)
+        cloth_warp_mask = cv2.imread(cloth_warp_mask_fn)
+        positions = np.where(
+            ((person_parse[:, :, 2] == 254) & (person_parse[:, :, 1] == 85) & (person_parse[:, :, 0] == 0))
+            | ((person_parse[:, :, 2] == 51) & (person_parse[:, :, 1] == 169) & (person_parse[:, :, 0] == 220))
+            | ((person_parse[:, :, 2] == 0) & (person_parse[:, :, 1] == 254) & (person_parse[:, :, 0] == 254))
+        )  # RGB
+        agnostic_mask[positions] = 255
 
         h, w, c = person.shape
         th, tw = int(h / self.down_scale), int(w / self.down_scale)
@@ -180,28 +203,49 @@ class TryOnDataset(Dataset):
         # Do not forget that OpenCV read images in BGR order.
         person = cv2.cvtColor(person, cv2.COLOR_BGR2RGB)
         openpose = cv2.cvtColor(openpose, cv2.COLOR_BGR2RGB)
-        agnostic = cv2.cvtColor(agnostic, cv2.COLOR_BGR2RGB)
+        # agnostic = cv2.cvtColor(agnostic, cv2.COLOR_BGR2RGB)
+        agnostic_mask = cv2.cvtColor(agnostic_mask, cv2.COLOR_BGR2GRAY)
         person = cv2.resize(person, (tw, th), interpolation=cv2.INTER_LINEAR)
         openpose = cv2.resize(openpose, (tw, th), interpolation=cv2.INTER_LINEAR)
-        agnostic = cv2.resize(agnostic, (tw, th), interpolation=cv2.INTER_LINEAR)
+        # agnostic = cv2.resize(agnostic, (tw, th), interpolation=cv2.INTER_LINEAR)
+        agnostic_mask = cv2.resize(agnostic_mask, (tw, th), interpolation=cv2.INTER_LINEAR)
+        agnostic_mask = cv2.GaussianBlur(agnostic_mask, (25, 25), sigmaX=15)
+        agnostic_mask[np.where(agnostic_mask != 0)] = 255
         cloth = cv2.cvtColor(cloth, cv2.COLOR_BGR2RGB)
         cloth = cv2.resize(cloth, (224, 224), interpolation=cv2.INTER_LINEAR)
         cloth_mask = cv2.cvtColor(cloth_mask, cv2.COLOR_BGR2RGB)
         cloth_mask = cv2.resize(cloth_mask, (224, 224), interpolation=cv2.INTER_LINEAR)
+        cloth_warp = cv2.cvtColor(cloth_warp, cv2.COLOR_BGR2RGB)
+        cloth_warp = cv2.resize(cloth_warp, (tw, th), interpolation=cv2.INTER_LINEAR)
+        cloth_warp_mask = cv2.cvtColor(cloth_warp_mask, cv2.COLOR_BGR2GRAY)
+        cloth_warp_mask = cv2.resize(cloth_warp_mask, (tw, th), interpolation=cv2.INTER_LINEAR)
 
         # Normalize source images to [0, 1].
         openpose = openpose.astype(np.float32) / 255.0
         cloth_mask = cloth_mask.astype(np.float32) / 255.0
+        cloth_warp_mask = cloth_warp_mask.astype(np.float32) / 255.0
+        agnostic_mask = agnostic_mask.astype(np.float32) / 255.0  # 1:agnostic-cloth pixels, 0:other visible parts
 
         # Normalize target images to [-1, 1].
         person = (person.astype(np.float32) / 127.5) - 1.0
-        agnostic = (agnostic.astype(np.float32) / 127.5) - 1.0
+        # agnostic = (agnostic.astype(np.float32) / 127.5) - 1.0
+        if np.random.uniform(0., 1.) >= self.reconstruct_rate:  # set1. in-painting
+            agnostic = person * (1. - agnostic_mask)[:, :, None]  # use self-designed agnostic mask
+            if self.use_warp_pasted_agnostic:  # paste warped cloth to agnostic image
+                cloth_warp = (cloth_warp.astype(np.float32) / 127.5) - 1.0
+                blend_mask = cloth_warp_mask[:, :, None]
+                agnostic = blend_mask * cloth_warp + (1 - blend_mask) * agnostic
+        else:  # set2. reconstruction
+            agnostic = person
+            agnostic_mask *= 0.
         cloth_masked = (cloth.astype(np.float32) * cloth_mask / 127.5) - 1.0
 
         return dict(jpg=person,  # reconstruction target
                     txt={"prompt": prompt, "cloth": cloth_masked},  # conditional inputs
                     hint=openpose,  # controlnet hint
-                    agnostic=agnostic)  # concat with de-noised image
+                    agnostic=agnostic,  # will be concatenated with de-noised image
+                    agnostic_mask=(1. - agnostic_mask),  # reversed mask of agnostic, 1:visible parts
+                    )
     
     @staticmethod
     def _nhwc_to_1hwrgb(x: torch.Tensor, is_zero_center: bool = True):
@@ -220,7 +264,8 @@ class TryOnDataset(Dataset):
             txt={"prompt": batch_dict["txt"]["prompt"][0], 
                  "cloth": self._nhwc_to_1hwrgb(batch_dict["txt"]["cloth"])},
             hint=self._nhwc_to_1hwrgb(batch_dict["hint"], is_zero_center=False),
-            agnostic=self._nhwc_to_1hwrgb(batch_dict["agnostic"])
+            agnostic=self._nhwc_to_1hwrgb(batch_dict["agnostic"]),
+            agnostic_mask=self._nhwc_to_1hwrgb(batch_dict["agnostic_mask"], is_zero_center=False),
         )
         
 
@@ -231,6 +276,8 @@ if __name__ == "__main__":
     dataset = TryOnDataset(
         root="/cfs/yuange/datasets/VTON-HD",
         mode="train",
+        reconstruct_rate=0.5,
+        use_warp_pasted_agnostic=True,
     )
     dataloader = DataLoader(dataset, num_workers=2, batch_size=batch_size, shuffle=False)
 
@@ -239,7 +286,7 @@ if __name__ == "__main__":
     if os.path.exists(snapshot_folder):
         os.system(f"rm -r {snapshot_folder}")
     os.makedirs(snapshot_folder, exist_ok=True)
-    max_index = 10
+    max_index = 20
 
     for index, batch in enumerate(tqdm(dataloader)):
         if index >= max_index:
@@ -264,8 +311,14 @@ if __name__ == "__main__":
                     print(f"{key}:", type(val))
         snapshot = dataset.get_batch0_snapshot(batch)
         fn = "id{:05d}".format(index)
-        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "01person")), snapshot["jpg"])
-        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "02cloth")), snapshot["txt"]["cloth"])
-        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "03openpose")), snapshot["hint"])
-        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "04agnostic")), snapshot["agnostic"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "01person")),
+                    snapshot["jpg"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "02cloth")),
+                    snapshot["txt"]["cloth"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "03openpose")),
+                    snapshot["hint"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "04agnostic")),
+                    snapshot["agnostic"])
+        cv2.imwrite(os.path.join(snapshot_folder, "{}_{}.jpg".format(fn, "05agnostic_mask")),
+                    snapshot["agnostic_mask"])
     print(f"Snapshot files saved to: {snapshot_folder}")

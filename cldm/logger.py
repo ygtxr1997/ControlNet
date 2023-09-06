@@ -11,7 +11,9 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 class ImageLogger(Callback):
     def __init__(self, batch_frequency=2000, max_images=4, clamp=True, increase_log_steps=True,
                  rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
-                 log_images_kwargs=None):
+                 log_images_kwargs=None,
+                 project_name: str = None,
+                 source_cfg_path: str = None):
         super().__init__()
         self.rescale = rescale
         self.batch_freq = batch_frequency
@@ -23,10 +25,12 @@ class ImageLogger(Callback):
         self.log_on_batch_idx = log_on_batch_idx
         self.log_images_kwargs = log_images_kwargs if log_images_kwargs else {}
         self.log_first_step = log_first_step
+        self.project_name = project_name
+        self.source_cfg_path = source_cfg_path
 
     @rank_zero_only
     def log_local(self, save_dir, split, images, global_step, current_epoch, batch_idx):
-        root = os.path.join(save_dir, "image_log", split)
+        root = os.path.join(save_dir, self.project_name, split)
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
             if self.rescale:
@@ -38,6 +42,12 @@ class ImageLogger(Callback):
             path = os.path.join(root, filename)
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             Image.fromarray(grid).save(path)
+
+    @rank_zero_only
+    def log_config(self, save_dir):
+        target_config_path = os.path.join(save_dir, self.project_name, "tryon_v15.yaml")
+        if not os.path.exists(target_config_path):
+            os.system(f"cp {self.source_cfg_path} {os.path.join(save_dir, self.project_name)}")
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         check_idx = batch_idx  # if self.log_on_batch_idx else pl_module.global_step
@@ -52,7 +62,9 @@ class ImageLogger(Callback):
                 pl_module.eval()
 
             with torch.no_grad():
-                images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
+                images = pl_module.log_images(batch, split=split,
+                                              plot_diffusion_rows=False,
+                                              **self.log_images_kwargs)
 
             for k in images:
                 N = min(images[k].shape[0], self.max_images)
@@ -64,6 +76,7 @@ class ImageLogger(Callback):
 
             self.log_local(pl_module.logger.save_dir, split, images,
                            pl_module.global_step, pl_module.current_epoch, batch_idx)
+            self.log_config(pl_module.logger.save_dir)
 
             if is_train:
                 pl_module.train()

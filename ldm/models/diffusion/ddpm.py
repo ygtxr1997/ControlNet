@@ -639,6 +639,8 @@ class LatentDiffusion(DDPM):
             assert config != '__is_unconditional__'
             model = instantiate_from_config(config)
             self.cond_stage_model = model
+            if hasattr(self.cond_stage_model, "freeze"):
+                self.cond_stage_model.freeze()
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
         denoise_row = []

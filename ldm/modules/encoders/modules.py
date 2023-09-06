@@ -3,6 +3,8 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel, CLIPVisionModel
+from transformers import CLIPVisionModelWithProjection
+from transformers import PvtModel
 
 import open_clip
 from ldm.util import default, count_params
@@ -134,29 +136,41 @@ class FrozenCLIPEmbedder(AbstractEncoder):
 
 class FrozenCLIPTextImageEmbedder(AbstractEncoder):
     """Uses the CLIP encoder for text and image (from huggingface)"""
-    LAYERS = [
+    TEXT_LAYERS = [
         "last",
         "pooled",
         "hidden"
     ]
+    IMAGE_LAYERS = [
+        "last",
+        "projection"
+    ]
     def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77,
-                 freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
+                 freeze=True, text_layer="last", text_layer_idx=None,
+                 use_text: bool = False,
+                 image_layer: str = "projection",
+                 ):
         super().__init__()
-        assert layer in self.LAYERS
+        assert text_layer in self.TEXT_LAYERS
+        assert image_layer in self.IMAGE_LAYERS
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
-        self.image_encoder = CLIPVisionModel.from_pretrained(version)
-        self.image_projection = nn.Linear(1024, 768, bias=False)  # learnable
+        self.use_text = use_text
+        # self.image_encoder = CLIPVisionModel.from_pretrained(version)
+        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(version)
+        image_in_channels = 768 if image_layer == "projection" else 1024
+        self.image_layer = image_layer
+        self.image_projection = nn.Linear(image_in_channels, 768, bias=False)  # learnable 2nd projection
 
         self.device = device
         self.max_length = max_length
         if freeze:
             self.freeze()
-        self.layer = layer
-        self.layer_idx = layer_idx
-        if layer == "hidden":
-            assert layer_idx is not None
-            assert 0 <= abs(layer_idx) <= 12
+        self.text_layer = text_layer
+        self.text_layer_idx = text_layer_idx
+        if text_layer == "hidden":
+            assert text_layer_idx is not None
+            assert 0 <= abs(text_layer_idx) <= 12
 
         self._init_weights()
 
@@ -166,6 +180,13 @@ class FrozenCLIPTextImageEmbedder(AbstractEncoder):
             std=1024 ** -0.5 * 0.02,
         )
 
+    def named_trainable_params_list(self):
+        named_trainable = []
+        for name, param in self.named_parameters():
+            if param.requires_grad is True:
+                named_trainable.append((name, param))
+        return named_trainable
+
     def freeze(self):
         self.transformer = self.transformer.eval()
         self.image_encoder = self.image_encoder.eval()
@@ -173,6 +194,7 @@ class FrozenCLIPTextImageEmbedder(AbstractEncoder):
             param.requires_grad = False
         for param in self.image_projection.parameters():  # unfreeze the projection layer
             param.requires_grad = True
+        print("[FrozenCLIPTextImageEmbedder] params except image_projection frozen.")
 
     def forward(self, text_image_dict):
         assert isinstance(text_image_dict, dict)
@@ -180,22 +202,36 @@ class FrozenCLIPTextImageEmbedder(AbstractEncoder):
         image = text_image_dict["image"]  # (B,C,H,W), in [-1,1]
 
         ''' 1. text '''
-        batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
-                                        return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
-        tokens = batch_encoding["input_ids"].to(self.device)
-        outputs = self.transformer(input_ids=tokens, output_hidden_states=self.layer=="hidden")
-        if self.layer == "last":
-            z = outputs.last_hidden_state
-        elif self.layer == "pooled":
-            z = outputs.pooler_output[:, None, :]
-        else:
-            z = outputs.hidden_states[self.layer_idx]
+        catted = []
+        if self.use_text:
+            batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length,
+                                            return_length=True, return_overflowing_tokens=False,
+                                            padding="max_length", return_tensors="pt")
+            tokens = batch_encoding["input_ids"].to(self.device)
+            outputs = self.transformer(input_ids=tokens, output_hidden_states=self.text_layer=="hidden")
+            if self.text_layer == "last":
+                z = outputs.last_hidden_state  # (B,77,768)
+            elif self.text_layer == "pooled":
+                z = outputs.pooler_output[:, None, :]
+            else:
+                z = outputs.hidden_states[self.layer_idx]
+            catted.append(z)
 
         ''' 2. image '''
-        z_image = self.image_encoder(image).last_hidden_state
-        z_image = self.image_projection(z_image)
+        # z_image = self.image_encoder(image).last_hidden_state
+        # z_image = self.image_projection(z_image)
+        #
+        # # return torch.cat([z, z_image], dim=1)  # (B,77+257,768)
+        # return torch.cat([z_image], dim=1)  # (B,257,768)  # TODO: single or multiple?
 
-        return torch.cat([z, z_image], dim=1)  # (B,77+257,768)
+        if self.image_layer == "projection":
+            z_image = self.image_encoder(image).image_embeds  # (B,768)
+            z_image = z_image[:, None, :]  # (B,1,768)
+        else:
+            z_image = self.image_encoder(image).last_hidden_state  # (B,257,1024)
+        z_image = self.image_projection(z_image)  # (B,y,768)
+        catted.append(z_image)
+        return torch.cat(catted, dim=1)  # (B,77+y,768)
 
     def encode(self, text_image_dict):
         return self(text_image_dict)
@@ -281,6 +317,81 @@ class FrozenCLIPT5Encoder(AbstractEncoder):
         return [clip_z, t5_z]
 
 
+class FrozenPVTImageEncoder(AbstractEncoder):
+    """Uses the PVT encoder for image pyramid features (from huggingface)"""
+    def __init__(self, version="Zetatech/pvt-large-224", device="cuda",
+                 freeze=True,
+                 fpn_layer_indices: list = None,
+                 mlp_in_channels: list = None,
+                 **kwargs
+                 ):
+        super().__init__()
+        self.pvt_model = PvtModel.from_pretrained(version)
+        if fpn_layer_indices is None:
+            fpn_layer_indices = [(0, 0, 1, 2),  # stage 1
+                                 (4, 6, 8, 10), # stage 2
+                                 (23, 37),      # stage 3
+                                 (38, 40, 41),  # stage 4
+                                 ]
+        self.fpn_layer_indices = fpn_layer_indices
+        if mlp_in_channels is None:
+            mlp_in_channels = [64, 128, 320, 512]  # by stage
+        self.mlp_in_channels = mlp_in_channels
+        self.image_projections = torch.nn.ModuleList()
+        for k in range(len(self.mlp_in_channels)):
+            self.image_projections.append(
+                nn.Linear(self.mlp_in_channels[k], 768, bias=False)  # shared and learnable projection
+            )
+
+        self.device = device
+        if freeze:
+            self.freeze()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for proj in self.image_projections:
+            nn.init.normal_(
+                proj.weight,
+                std=1024 ** -0.5 * 0.02,
+            )
+
+    def named_trainable_params_list(self):
+        named_trainable = []
+        for name, param in self.named_parameters():
+            if param.requires_grad is True:
+                named_trainable.append((name, param))
+        return named_trainable
+
+    def freeze(self):
+        self.pvt_model = self.pvt_model.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+        for proj in self.image_projections:
+            for param in proj.parameters():  # unfreeze the projection layer
+                param.requires_grad = True
+        print("[FrozenPVTImageEncoder] params except image_projections frozen.")
+
+    def forward(self, text_image_dict):
+        assert isinstance(text_image_dict, dict)
+        text = text_image_dict["text"]  # List[String], not used
+        image = text_image_dict["image"]  # (B,C,H,W), in [-1,1]
+
+        ''' 1. image '''
+        ret_feats = []
+        fpn_feats = self.pvt_model(image, output_hidden_states=True).hidden_states
+        # (B,3136=56x56,64)x3; (B,784=28x28,128)x8; (B,196=14x14,320)x27; (B,50=7x7+1,512)x4;
+        for stage in range(len(self.fpn_layer_indices)):
+            proj = self.image_projections[stage]
+            for fpn_layer_index in self.fpn_layer_indices[stage]:
+                fpn_feat = proj(fpn_feats[fpn_layer_index])  # (B,?,768)
+                ret_feats.append(fpn_feat)
+        return ret_feats
+
+    def encode(self, text_image_dict):
+        return self(text_image_dict)
+
+
 if __name__ == "__main__":
     import torch
     import transformers
@@ -314,13 +425,20 @@ if __name__ == "__main__":
 
     ''' image '''
     # image_encoder = CLIPVisionModel.from_pretrained(version)
-    # outputs = image_encoder(xi)
+    # outputs = image_encoder(xi, output_hidden_states=True)
+    # # {"last_hidden_state":(B,257,1024), "pooler_output":(B,1024)}
     # print("[image] encoder output:")
     # for k in outputs.keys():
-    #     print(f"|---{k}: {outputs[k].shape}; after projection: {visual_proj(outputs[k]).shape}")
+    #     v = outputs[k]
+    #     if isinstance(v, tuple):
+    #         print(f"|---{k}: {len(v)};")
+    #         for i, x in enumerate(v):
+    #             print(f"   |---{i}: {x.shape}; after projection: {visual_proj(x).shape}")
+    #     else:
+    #         print(f"|---{k}: {v.shape}; after projection: {visual_proj(v).shape}")
     #
     # image_encoder_proj = CLIPVisionModelWithProjection.from_pretrained(version)
-    # outputs = image_encoder_proj(xi)
+    # outputs = image_encoder_proj(xi)  # {"last_hidden_state":(B,257,1024), "image_embeds":(B,768)}
     # print("[image] encoder_with_projection output:")
     # for k in outputs.keys():
     #     print(f"|---{k}: {outputs[k].shape}")
@@ -334,6 +452,56 @@ if __name__ == "__main__":
     # print(f"|---image: {output_image.shape}")
 
     ''' my FrozenCLIPTextImageEmbedder '''
-    net = FrozenCLIPTextImageEmbedder().cuda()
-    z = net({"text": text, "image": xi.cuda()})
-    print("[FrozenCLIPTextImageEmbedder] output:", z.shape)
+    # net = FrozenCLIPTextImageEmbedder(
+    #     image_layer="last"
+    # ).cuda()
+    # z = net({"text": text, "image": xi.cuda()})
+    # print("[FrozenCLIPTextImageEmbedder] output:", z.shape)
+
+    ''' Pyramid Vision Transformer '''
+    # from transformers import AutoImageProcessor, PvtModel, PvtForImageClassification
+    # import torch
+    # import numpy as np
+    # from einops import rearrange
+    # from PIL import Image
+    #
+    # image = Image.open("./test_imgs/cloth_00013_00.jpg").convert("RGB").resize((224, 224))
+    # image = np.array(image)
+    #
+    # image_processor = AutoImageProcessor.from_pretrained("Zetatech/pvt-tiny-224")
+    # model = PvtModel.from_pretrained("Zetatech/pvt-tiny-224")
+    # # model = PvtForImageClassification.from_pretrained("Zetatech/pvt-tiny-224")
+    #
+    # with torch.no_grad():
+    #     # inputs = image_processor(image, return_tensors="pt")
+    #     # outputs = model(**inputs, output_hidden_states=True)
+    #
+    #     inputs = torch.from_numpy(image).unsqueeze(0).float()
+    #     inputs = rearrange(inputs, "n h w c -> n c h w").contiguous()
+    #     inputs = (inputs / 127.5) - 1.
+    #     outputs = model(inputs, output_hidden_states=True)
+    #     print(outputs.keys())
+    #
+    # if hasattr(outputs, "last_hidden_state"):
+    #     last_hidden_states = outputs.last_hidden_state
+    #     print(last_hidden_states.shape)
+    #     for i, hidden in enumerate(outputs.hidden_states):
+    #         add_str = ""
+    #         if hidden.shape == last_hidden_states.shape:
+    #             add_str = f", diff = {torch.abs(last_hidden_states - hidden).sum()}"
+    #         print(f"|---{i}: {hidden.shape} {add_str}")
+    #     # (B,3136=56x56,64)x3; (B,784=28x28,128)x8; (B,196=14x14,320)x27; (B,50=7x7+1,512)x4;
+    #
+    # if hasattr(outputs, "logits"):
+    #     # model predicts one of the 1000 ImageNet classes
+    #     logits = outputs.logits
+    #     predicted_label = logits.argmax(-1).item()
+    #     print("Predict class:", model.config.id2label[predicted_label])
+
+    ''' my FrozenPVTImageEncoder '''
+    net = FrozenPVTImageEncoder(
+
+    ).cuda()
+    feats = net({"text": text, "image": xi.cuda()})
+    for i, feat in enumerate(feats):
+        print(f"[FrozenPVTImageEncoder] output {i}:", feat.shape)
