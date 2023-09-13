@@ -321,24 +321,51 @@ class DDIMSampler(object):
 
 
 class DDIMSamplerTryOn(DDIMSampler):
-    def __init__(self, model, schedule="linear", tryon_dataset=None, **kwargs):
+    def __init__(self, model, schedule="linear",
+                 tryon_dataset=None, warp_infer=None,
+                 **kwargs):
         super().__init__(model=model, schedule=schedule, **kwargs)
         self.cloth_agnostic_dataset = tryon_dataset
-    def _get_try_on_test_images(self, index: int = None, batch_size: int = 1,):
-        if index is None:
-            index = np.random.randint(len(self.cloth_agnostic_dataset))
-        item = self.cloth_agnostic_dataset[index]
+        self.warp_infer = warp_infer
 
-        person = item["jpg"]
-        cloth_masked = item["txt"]["cloth"]
-        agnostic = item["agnostic"]
-        openpose = item["hint"]
-        agnostic_mask = item["agnostic_mask"]
+    def _get_try_on_test_images(self, index_person: int = None, index_cloth: int = None, batch_size: int = 1,):
+        if index_person is None:
+            index_person = np.random.randint(len(self.cloth_agnostic_dataset))
+            index_cloth = index_person
+        elif index_cloth is None:
+            index_cloth = index_person
+        item1 = self.cloth_agnostic_dataset[index_person]
+        item2 = self.cloth_agnostic_dataset[index_cloth]
 
-        person = self._hwc_to_bchw(person, bs=batch_size)
+        person = item1["jpg"]
+        openpose = item1["hint"]
+        densepose = item1["ori"]["densepose"]
+        ori_agnostic_parse = item1["ori"]["agnostic_parse"]
+        agnostic = item1["agnostic"]
+        agnostic_mask = item1["agnostic_mask"]
+
+        cloth_masked = item2["txt"]["cloth"]
+        ori_cloth_mask = item2["ori"]["cloth_mask"]
+        ori_cloth = item2["ori"]["cloth"]
+
+        person = self._hwc_to_bchw(person, bs=batch_size, need_encode=True)
+        agnostic = self._hwc_to_bchw(agnostic, bs=batch_size, need_encode=False)  # 1st, do not encode
         cloth_masked = self._hwc_to_bchw(cloth_masked, bs=batch_size)
-        agnostic = self._hwc_to_bchw(agnostic, bs=batch_size, need_encode=True)
+        ori_cloth_mask = self._hwc_to_bchw(ori_cloth_mask, bs=batch_size)
+        ori_cloth = self._hwc_to_bchw(ori_cloth, bs=batch_size)
         openpose = self._hwc_to_bchw(openpose, bs=batch_size)
+        densepose = self._hwc_to_bchw(densepose, bs=batch_size)
+
+        pa_one_hot = self.cloth_agnostic_dataset.seg_to_onehot(
+            ori_agnostic_parse, bs=batch_size, device=densepose.device)
+        warp_dict = self.warp_infer.infer(
+            pa_one_hot, densepose, ori_cloth, ori_cloth_mask,
+            out_hw=agnostic.shape[-2:]
+        )
+        warped_cloth = warp_dict["warped_cloth"]
+        warped_mask = warp_dict["warped_mask"]
+        agnostic = warped_mask * warped_cloth + (1. - warped_mask) * agnostic
+        agnostic = self._hwc_to_bchw(agnostic, bs=batch_size, need_encode=True)  # 2nd, encode here
         agnostic_mask = self._hwc_to_bchw(agnostic_mask, bs=batch_size, downsample_tgt_size=agnostic.shape[-2:])
 
         return person, cloth_masked, agnostic, openpose, agnostic_mask
@@ -346,14 +373,15 @@ class DDIMSamplerTryOn(DDIMSampler):
     def _hwc_to_bchw(self, x, bs, need_encode: bool = False,
                      downsample_tgt_size: tuple = None):
         device = self.model.betas.device
-        x = torch.FloatTensor(x)
-        x = x.to(device)
-        x = x.unsqueeze(0)  # add batch dim
-        if x.ndim == 3:
-            x = x.unsqueeze(-1)  # add channel dim
-        x = rearrange(x, 'b h w c -> b c h w')
-        x = x.repeat(bs, 1, 1, 1)
-        x = x.to(memory_format=torch.contiguous_format).float()
+        if not isinstance(x, torch.Tensor):
+            x = torch.FloatTensor(x)
+            x = x.to(device)
+            x = x.unsqueeze(0)  # add batch dim
+            if x.ndim == 3:
+                x = x.unsqueeze(-1)  # add channel dim
+            x = rearrange(x, 'b h w c -> b c h w')
+            x = x.repeat(bs, 1, 1, 1)
+            x = x.to(memory_format=torch.contiguous_format).float()
         if need_encode:
             encoder_posterior = self.model.encode_first_stage(x)
             x = self.model.get_first_stage_encoding(encoder_posterior).detach()
@@ -361,17 +389,19 @@ class DDIMSamplerTryOn(DDIMSampler):
             x = F.interpolate(x, size=downsample_tgt_size, mode="bilinear", align_corners=True)
         return x
 
-    def get_apply_input(self, index: int = 0, num_samples: int = 1,
+    def get_apply_input(self, index_person: int = 0, index_cloth: int = 0,
+                        num_samples: int = 1,
                         device: torch.device = None):
-        person, cloth_masked, agnostic_enc, openpose, agnostic_mask = self._get_try_on_test_images(
-            index=index,
+        person_enc, cloth_masked, agnostic_enc, openpose, agnostic_mask = self._get_try_on_test_images(
+            index_person=index_person, index_cloth=index_cloth,
             batch_size=num_samples,
         )
+        person_enc = person_enc.to(device)
         agnostic_enc = agnostic_enc.to(device)
         openpose = openpose.to(device)
         cloth_masked = cloth_masked.to(device)
         agnostic_mask = agnostic_mask.to(device)
-        return agnostic_enc, openpose, cloth_masked, agnostic_mask
+        return person_enc, agnostic_enc, openpose, cloth_masked, agnostic_mask
 
     @torch.no_grad()
     def ddim_sampling(self, cond, shape,

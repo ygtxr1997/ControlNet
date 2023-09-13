@@ -17,6 +17,7 @@ from cldm.dataloader import create_dataset, parse_training_config, get_parser
 cmd_parser = get_parser()
 cmd_opt, _ = cmd_parser.parse_known_args()
 log_dir = cmd_opt.log_dir
+batch_size = cmd_opt.batch_size
 
 """ Check resuming """
 resume_project_folder = cmd_opt.resume_project_folder
@@ -37,7 +38,7 @@ print(f"[main] config file loaded from: {cfg_file}. (Resume checkpoint?: {resume
 model_config = parse_model_config(cfg_file)
 train_config = parse_training_config(cfg_file)
 sd_path = train_config.sd_path
-batch_size = train_config.batch_size
+batch_size = train_config.batch_size if batch_size <=0 else batch_size
 logger_freq = train_config.logger_freq
 learning_rate = train_config.learning_rate
 sd_locked = train_config.sd_locked

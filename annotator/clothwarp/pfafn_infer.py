@@ -38,6 +38,7 @@ class PFAFNImageInfer(object):
     @torch.no_grad()
     def infer(self, parse_agnostic: torch.Tensor, dense_pose: torch.Tensor,
               cloth: torch.Tensor, cloth_mask: torch.Tensor,
+              out_hw: tuple = None,
               ):
         """
         Like forward().
@@ -45,13 +46,14 @@ class PFAFNImageInfer(object):
         @param dense_pose: (B,RGB,768,1024), in [-1,1]
         @param cloth: (B,RGB,768,1024), in [-1,1]
         @param cloth_mask: (B,1,768,1024), in [0,1]
+        @param out_hw: output H and W
         @returns: {"warped_cloth":(B,RGB,768,1024) in [-1,1], "warped_mask":(B,1,768,1024) in [0,1]}
         """
         ih, iw = parse_agnostic.shape[2:]
         th, tw = (256, 192)
         parse_agnostic_down = F.interpolate(parse_agnostic, size=(th, tw), mode='nearest')
-        dense_posed_down = F.interpolate(dense_pose, size=(th, tw), mode='bilinear')
-        cloth_down = F.interpolate(cloth, size=(th, tw), mode='bilinear')
+        dense_posed_down = F.interpolate(dense_pose, size=(th, tw), mode='bilinear', align_corners=True)
+        cloth_down = F.interpolate(cloth, size=(th, tw), mode='bilinear', align_corners=True)
         cloth_mask_down = F.interpolate(cloth_mask, size=(th, tw), mode='nearest')
         cloth_mask_down = torch.FloatTensor((cloth_mask_down.cpu().numpy() > 0.5).astype(float)).to(cloth.device)
 
@@ -63,17 +65,18 @@ class PFAFNImageInfer(object):
                                     mode='bilinear', padding_mode='zeros')
 
         if ih != 256:
-            last_flow = F.interpolate(last_flow, size=(ih, iw), mode='bilinear')
+            last_flow = F.interpolate(last_flow, size=(ih, iw), mode='bilinear', align_corners=True)
             warped_cloth = F.grid_sample(cloth, last_flow.permute(0, 2, 3, 1),
                                          mode='bilinear', padding_mode='border')
             warped_mask = F.grid_sample(cloth_mask, last_flow.permute(0, 2, 3, 1),
                                         mode='bilinear', padding_mode='zeros')
 
-        # warped_cloth = F.interpolate(warped_cloth, size=(ih, iw), align_corners=True, mode="bilinear")
-        # warped_mask = F.interpolate(warped_mask, size=(ih, iw), align_corners=True, mode="bilinear")
+        if out_hw is not None:
+            warped_cloth = F.interpolate(warped_cloth, size=out_hw, mode="bilinear", align_corners=True)
+            warped_mask = F.interpolate(warped_mask, size=out_hw, mode="bilinear", align_corners=True)
         return {
-            "warped_cloth": warped_cloth,
-            "warped_mask": warped_mask,
+            "warped_cloth": warped_cloth.clamp(-1., 1.),
+            "warped_mask": warped_mask.clamp(0., 1.),
         }
 
 

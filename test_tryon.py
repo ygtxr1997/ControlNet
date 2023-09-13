@@ -14,15 +14,18 @@ import random
 from pytorch_lightning import seed_everything
 from annotator.util import resize_image, HWC3
 from annotator.openpose import OpenposeDetector
+from annotator.clothwarp.pfafn_infer import PFAFNImageInfer
 from cldm.model import create_model, load_state_dict, parse_model_config
 from cldm.ddim_hacked import DDIMSamplerTryOn
 from ldm.data.tryon_dataset import TryOnDataset
 
 
+device = torch.device("cuda")
+
 apply_openpose = OpenposeDetector()
 
-project_folder = "2023-09-04T15-46-02"
-ckpt_name = "epoch=131-step=48048.ckpt"
+project_folder = "2023-09-07T17-44-16"
+ckpt_name = "epoch=218-step=79716.ckpt"
 config_file = f"./logs/{project_folder}/tryon_v15.yaml"
 model = create_model(config_file).cpu()
 model_config = parse_model_config(config_file)
@@ -46,29 +49,31 @@ model = model.cuda()
 dataset = TryOnDataset(
     root="/cfs/yuange/datasets/VTON-HD",
     mode="test",
-    use_warp_pasted_agnostic=True,
+    use_warp_pasted_agnostic=False,
+)
+warp_infer = PFAFNImageInfer(
+    device=device
 )
 ddim_sampler = DDIMSamplerTryOn(
     model,
-    tryon_dataset=dataset
+    tryon_dataset=dataset,
+    warp_infer=warp_infer,
 )
 
 
-def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta, test_index):
+def process(input_person_image, input_cloth_image,
+            prompt,
+            a_prompt, n_prompt,
+            num_samples,
+            image_resolution, detect_resolution,
+            ddim_steps, guess_mode, strength, scale, seed, eta,
+            test_person_index, test_cloth_index):
     with torch.no_grad():
-        index = test_index
-        item = dataset[index]
-
-        person = item["jpg"]
-        cloth_masked = item["txt"]["cloth"]
-        agnostic = item["agnostic"]
-        openpose = item["hint"]
-
-        input_image = HWC3(input_image)
-        detected_map, _ = apply_openpose(resize_image(input_image, detect_resolution))
+        input_person_image = HWC3(input_person_image)
+        detected_map, _ = apply_openpose(resize_image(input_person_image, detect_resolution))
         detected_map = HWC3(detected_map)
-        img = resize_image(input_image, image_resolution)
-        H, W, C = img.shape
+        img_person = resize_image(input_person_image, image_resolution)
+        H, W, C = img_person.shape
 
         detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_NEAREST)  # (H,W,3), in [0,255]
 
@@ -83,10 +88,10 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
         if config.save_memory:
             model.low_vram_shift(is_diffusing=False)
 
-        device = torch.device("cuda")
         prompt = "an image"
-        agnostic, openpose, cloth_masked, agnostic_mask = ddim_sampler.get_apply_input(
-            index, num_samples=num_samples, device=device)
+        person_enc, agnostic, openpose, cloth_masked, agnostic_mask = ddim_sampler.get_apply_input(
+            test_person_index, test_cloth_index,
+            num_samples=num_samples, device=device)
         control_list = [openpose]
         if model_config.params.feed_cloth_to_controlnet:
             cloth_control = F.interpolate(cloth_masked, size=openpose.shape[-2:], mode="bilinear", align_corners=True)
@@ -100,11 +105,13 @@ def process(input_image, prompt, a_prompt, n_prompt, num_samples, image_resoluti
             "text": [n_prompt] * num_samples,
             "image": torch.zeros_like(cloth_masked).to(cloth_masked.device),
         }
-        apply_input = {"z_x": None, "z_ag": agnostic, "z_ag_m": agnostic_mask}
+        t = torch.ones((agnostic.shape[0],), device=agnostic.device).long() * (1000 - 1)
+        z_x_t_noisy = model.q_sample(x_start=person_enc, t=t, noise=torch.randn_like(person_enc))  # DDIM inversion z_T
+        apply_input = {"z_x": z_x_t_noisy, "z_ag": agnostic, "z_ag_m": agnostic_mask}
         # apply_input = {"z_x": None, "z_ag": torch.randn_like(agnostic).to(agnostic.device)}
         cond = {"c_concat": control_list, "c_crossattn": [model.get_learned_conditioning(cond_in_dict)]}
         un_cond = {"c_concat": None if guess_mode else control_list,
-                   "c_crossattn": [model.get_learned_conditioning(un_cond_in_dict)]}
+                   "c_crossattn": [model.get_learned_conditioning(cond_in_dict)]}  # Negative Prompt Inversion
         shape = (4, H // 8, W // 8)
         shape = (agnostic.shape[1], agnostic.shape[2], agnostic.shape[3])
 
@@ -134,11 +141,14 @@ with block:
         gr.Markdown("## Control Stable Diffusion with Human Pose")
     with gr.Row():
         with gr.Column():
-            input_image = gr.Image(source='upload', type="numpy")
-            prompt = gr.Textbox(label="Prompt")
+            with gr.Row():
+                in_person_image = gr.Image(source='upload', type="numpy", label="Person")
+                in_cloth_image = gr.Image(source='upload', type="numpy", label="Cloth")
+            prompt = gr.Textbox(label="Prompt")  # not used
             run_button = gr.Button(label="Run")
             with gr.Accordion("Advanced options", open=False):
-                test_index = gr.Slider(label="Test Index", minimum=0, maximum=2031, value=0, step=1)
+                test_person_index = gr.Slider(label="Person Index", minimum=0, maximum=2031, value=0, step=1)
+                test_cloth_index = gr.Slider(label="Cloth Index", minimum=0, maximum=2031, value=0, step=1)
                 num_samples = gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
                 image_resolution = gr.Slider(label="Image Resolution", minimum=256, maximum=768, value=512, step=64)
                 strength = gr.Slider(label="Control Strength", minimum=0.0, maximum=2.0, value=1.0, step=0.01)
@@ -153,8 +163,10 @@ with block:
                                       value='longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality')
         with gr.Column():
             result_gallery = gr.Gallery(label='Output', show_label=False, elem_id="gallery").style(grid=2, height='auto')
-    ips = [input_image, prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta, test_index]
+    ips = [in_person_image, in_cloth_image,
+           prompt, a_prompt, n_prompt, num_samples, image_resolution, detect_resolution, ddim_steps, guess_mode, strength, scale, seed, eta,
+           test_person_index, test_cloth_index]
     run_button.click(fn=process, inputs=ips, outputs=[result_gallery])
 
 
-block.launch(server_name='0.0.0.0')
+block.launch(server_name='0.0.0.0', server_port=7860)

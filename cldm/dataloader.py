@@ -36,6 +36,12 @@ def get_parser(**parser_kwargs):
         help="The indices of GPUs.",
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=-1,
+        help="The training batch size.",
+    )
+    parser.add_argument(
         "--resume_project_folder",
         type=str,
         default="",
