@@ -21,8 +21,8 @@ class CPDataset(data.Dataset):
         self.root = dataroot
         self.datamode = mode  # train or test or self-defined
         self.data_list = mode + '_pairs.txt'
-        self.fine_height = image_size
-        self.fine_width = int(image_size / 256 * 192)
+        self.fine_height = image_size  # 512
+        self.fine_width = int(image_size / 256 * 192)  # 384
         self.semantic_nc = semantic_nc
         self.data_path = osp.join(dataroot, mode)
         self.transform = transforms.Compose([

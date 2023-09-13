@@ -34,7 +34,7 @@ class BaseOptions():
 
         self.initialized = True
 
-    def parse(self, save=True):
+    def parse(self, save=True, verbose=True):
         if not self.initialized:
             self.initialize()
         self.opt = self.parser.parse_args()
@@ -52,9 +52,10 @@ class BaseOptions():
 
         args = vars(self.opt)
 
-        print('------------ Options -------------')
-        for k, v in sorted(args.items()):
-            print('%s: %s' % (str(k), str(v)))
-        print('-------------- End ----------------')
+        if verbose:
+            print('------------ Options -------------')
+            for k, v in sorted(args.items()):
+                print('%s: %s' % (str(k), str(v)))
+            print('-------------- End ----------------')
 
         return self.opt
